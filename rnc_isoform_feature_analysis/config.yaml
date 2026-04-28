@@ -1,0 +1,17 @@
+inputs:
+  results_csv: "results.csv"
+  annotation_gtf: "annotation.gtf"
+  genome_fasta: "genome.fa"
+  canonical_transcripts: null          # optional TSV with columns: gene_name, transcript_id
+  domain_annotation: null              # optional interproscan/pfam tsv
+  mirna_prediction: null               # optional miranda/targetscan tsv
+
+outputs:
+  sequences_dir: "rnc_isoform_feature_analysis/output/sequences"
+  tables_dir: "rnc_isoform_feature_analysis/output/tables"
+  figures_dir: "rnc_isoform_feature_analysis/output/figures"
+
+params:
+  rnafold_bin: "RNAfold"
+  rnafold_max_len: 1500
+  cds_start_flank: 70
