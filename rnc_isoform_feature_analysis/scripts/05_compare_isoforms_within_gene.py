@@ -492,28 +492,28 @@ def main():
     filtered_fp = tables_dir / f"high_vs_low_isoform_comparison.filtered.ddif_gt_{threshold_tag}.tsv"
     comp_filtered.to_csv(filtered_fp, sep="\t", index=False)
 
-   # 为了兼容原来的 06 脚本命名，也把 high-vs-low 的结果保存成默认 pairwise 文件
+       # 为了兼容原来的 06 脚本命名，也把 high-vs-low 的结果保存成默认 pairwise 文件
     pair_fp = tables_dir / "isoform_pairwise_comparison.tsv"
     comp_filtered.to_csv(pair_fp, sep="\t", index=False)
 
-stats_df = add_high_low_statistics(comp_filtered, threshold)
-stats_fp = tables_dir / "statistics_summary.tsv"
-stats_df.to_csv(stats_fp, sep="\t", index=False)
+    stats_df = add_high_low_statistics(comp_filtered, threshold)
+    stats_fp = tables_dir / "statistics_summary.tsv"
+    stats_df.to_csv(stats_fp, sep="\t", index=False)
 
-direction_df = add_direction_summary(comp_filtered, threshold)
-direction_fp = tables_dir / "high_vs_low_feature_direction_summary.tsv"
-direction_df.to_csv(direction_fp, sep="\t", index=False)
-logger.info("High-vs-low feature direction summary written: %s", direction_fp)
+    direction_df = add_direction_summary(comp_filtered, threshold)
+    direction_fp = tables_dir / "high_vs_low_feature_direction_summary.tsv"
+    direction_df.to_csv(direction_fp, sep="\t", index=False)
+    logger.info("High-vs-low feature direction summary written: %s", direction_fp)
 
-logger.info("Input transcript feature table: %s", input_fp)
-logger.info("All high-vs-low gene comparison written: %s", all_fp)
-logger.info("Filtered high-vs-low comparison written: %s", filtered_fp)
-logger.info("Default isoform_pairwise_comparison.tsv overwritten with high-vs-low results: %s", pair_fp)
-logger.info("Statistics summary written: %s", stats_fp)
+    logger.info("Input transcript feature table: %s", input_fp)
+    logger.info("All high-vs-low gene comparison written: %s", all_fp)
+    logger.info("Filtered high-vs-low comparison written: %s", filtered_fp)
+    logger.info("Default isoform_pairwise_comparison.tsv overwritten with high-vs-low results: %s", pair_fp)
+    logger.info("Statistics summary written: %s", stats_fp)
 
-logger.info("Threshold: high_Delta_IF - low_Delta_IF > %.4g", threshold)
-logger.info("Genes with >=2 valid isoforms: %d", len(comp_all))
-logger.info("Genes retained after threshold: %d", len(comp_filtered))
+    logger.info("Threshold: high_Delta_IF - low_Delta_IF > %.4g", threshold)
+    logger.info("Genes with >=2 valid isoforms: %d", len(comp_all))
+    logger.info("Genes retained after threshold: %d", len(comp_filtered))
 
     if not comp_filtered.empty:
         logger.info(
