@@ -2,125 +2,116 @@
 from __future__ import annotations
 
 import argparse
-import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from utils import (
-    extract_polyA_features,
-    get_context_around,
-    kozak_score_and_strength,
-    load_config,
-    scan_uorfs,
-    setup_logger,
-)
+from utils import add_common_cli_args, kozak_context_score, read_config, scan_polya, scan_uorfs, setup_logger
 
 
-def parse_mirna_table(path: str, tx_col_candidates=None, mirna_col_candidates=None):
-    if tx_col_candidates is None:
-        tx_col_candidates = ["transcript_id", "target_id", "sequence_id", "mRNA"]
-    if mirna_col_candidates is None:
-        mirna_col_candidates = ["miRNA", "mirna", "miRNA_id", "query_id"]
-    df = pd.read_csv(path, sep="\t")
-    tx_col = next((c for c in tx_col_candidates if c in df.columns), None)
-    mir_col = next((c for c in mirna_col_candidates if c in df.columns), None)
-    if tx_col is None:
-        return pd.DataFrame(columns=["transcript_id", "miRNA_site_count", "unique_miRNA_count", "conserved_site_count", "strongest_binding_energy"])
-    if mir_col is None:
-        df["_mirna"] = "NA"
-        mir_col = "_mirna"
+def parse_mirna_table(path: Path, tid_col: str = "transcript_id_base") -> pd.DataFrame:
+    df = pd.read_csv(path, sep=None, engine="python")
+    if tid_col not in df.columns:
+        for cand in ["transcript_id", "target_id", "mRNA"]:
+            if cand in df.columns:
+                df[tid_col] = df[cand].astype(str).map(lambda x: x.split(".")[0])
+                break
+    if tid_col not in df.columns:
+        return pd.DataFrame(columns=[tid_col, "miRNA_site_count", "unique_miRNA_count", "conserved_site_count", "strongest_binding_energy"])
 
-    agg = df.groupby(tx_col).agg(
-        miRNA_site_count=(tx_col, "size"),
-        unique_miRNA_count=(mir_col, lambda x: x.nunique()),
-    ).reset_index().rename(columns={tx_col: "transcript_id"})
+    if "miRNA" not in df.columns:
+        for cand in ["mirna", "miRNA_id", "query_id"]:
+            if cand in df.columns:
+                df["miRNA"] = df[cand]
+                break
+        if "miRNA" not in df.columns:
+            df["miRNA"] = "NA"
 
-    if "conserved_site_count" in df.columns:
-        cons = df.groupby(tx_col)["conserved_site_count"].sum().reset_index().rename(columns={tx_col: "transcript_id"})
-        agg = agg.merge(cons, on="transcript_id", how="left")
-    else:
-        agg["conserved_site_count"] = np.nan
+    energy_col = None
+    for c in ["energy", "binding_energy", "MFE", "score"]:
+        if c in df.columns:
+            energy_col = c
+            break
 
-    energy_col = next((c for c in ["energy", "binding_energy", "mfe"] if c in df.columns), None)
-    if energy_col:
-        en = df.groupby(tx_col)[energy_col].min().reset_index().rename(columns={tx_col: "transcript_id", energy_col: "strongest_binding_energy"})
-        agg = agg.merge(en, on="transcript_id", how="left")
-    else:
-        agg["strongest_binding_energy"] = np.nan
-
-    return agg
+    out = []
+    for tid, g in df.groupby(tid_col):
+        d = {
+            tid_col: tid,
+            "miRNA_site_count": len(g),
+            "unique_miRNA_count": g["miRNA"].nunique(dropna=True),
+            "conserved_site_count": g["conserved"].sum() if "conserved" in g.columns else np.nan,
+            "strongest_binding_energy": g[energy_col].min() if energy_col else np.nan,
+        }
+        out.append(d)
+    return pd.DataFrame(out)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Scan sequence motifs: Kozak, uORF, polyA, miRNA summary")
-    ap.add_argument("--config", default="config.yaml")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Scan Kozak/uORF/polyA and integrate optional miRNA predictions")
+    add_common_cli_args(parser)
+    args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    logger = setup_logger("02_motif", os.path.join(cfg["output"]["tables_dir"], "02_scan_sequence_motifs.log"))
+    cfg = read_config(args.config)
+    logger = setup_logger("02_scan_sequence_motifs", Path(args.log) if args.log else None)
 
-    df = pd.read_csv(os.path.join(cfg["output"]["tables_dir"], "transcript_features_step1.tsv"), sep="\t")
+    table = pd.read_csv(Path(cfg["outputs"]["tables_dir"]) / "transcript_basic_features.tsv", sep="\t")
+    seq_dir = Path(cfg["outputs"]["sequences_dir"])
 
-    out_rows = []
-    for _, r in df.iterrows():
-        tx_seq = str(r.get("transcript_sequence", "") or "")
-        utr5 = str(r.get("five_utr_sequence", "") or "")
-        utr3 = str(r.get("three_utr_sequence", "") or "")
-        start_pos = r.get("start_codon_pos_in_transcript", np.nan)
+    def read_fa_to_dict(fp: Path):
+        d = {}
+        cur = None
+        with open(fp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    cur = line[1:].split()[0]
+                    d[cur] = ""
+                else:
+                    d[cur] += line.upper()
+        return d
 
-        if pd.notna(start_pos):
-            context = get_context_around(tx_seq, int(start_pos), left=6, right=2)
-            k_score, k_strength = kozak_score_and_strength(context)
-        else:
-            context, k_score, k_strength = "NA", 0, "NA"
+    tx = read_fa_to_dict(seq_dir / "transcript.fa")
+    five = read_fa_to_dict(seq_dir / "five_utr.fa")
+    three = read_fa_to_dict(seq_dir / "three_utr.fa")
 
-        uorfs = scan_uorfs(utr5)
-        longest_nt = max([(b - a) for a, b in uorfs], default=0)
-        longest_aa = longest_nt // 3 if longest_nt else 0
-        uorf_strong = 0
-        coord_text = []
-        for a, b in uorfs:
-            uctx = get_context_around(utr5, a, left=6, right=2)
-            _, us = kozak_score_and_strength(uctx)
-            if us == "strong":
-                uorf_strong += 1
-            coord_text.append(f"{a + 1}-{b}")
+    motif_rows = []
+    for _, r in table.iterrows():
+        tid = r["transcript_id_base"]
+        tx_seq = tx.get(tid, "")
+        five_seq = five.get(tid, "")
+        three_seq = three.get(tid, "")
 
-        poly = extract_polyA_features(utr3)
+        start_idx = len(five_seq) if tx_seq else -1
+        ctx, sc, st = kozak_context_score(tx_seq, start_idx)
+        u = scan_uorfs(five_seq)
+        p = scan_polya(three_seq)
 
-        out_rows.append(
-            {
-                "transcript_id": r["transcript_id"],
-                "uORF_count": len(uorfs),
-                "longest_uORF_length_nt": longest_nt,
-                "longest_uORF_length_aa": longest_aa,
-                "uORF_with_strong_kozak_count": uorf_strong,
-                "uORF_coordinates_in_5utr": ";".join(coord_text),
-                "kozak_context": context,
-                "kozak_score": k_score,
-                "kozak_strength": k_strength,
-                **poly,
-            }
-        )
+        motif_rows.append({"transcript_id_base": tid, "kozak_context": ctx, "kozak_score": sc, "kozak_strength": st, **u, **p})
 
-    motif_df = pd.DataFrame(out_rows)
+    motif_df = pd.DataFrame(motif_rows)
 
-    mirna_path = cfg["input"].get("mirna_tsv")
-    if mirna_path and os.path.exists(mirna_path):
-        mirna_df = parse_mirna_table(mirna_path)
-        logger.info("Loaded miRNA table: %s", mirna_path)
+    mirna_df = None
+    mirna_input = cfg["inputs"].get("mirna_prediction")
+    if mirna_input and Path(mirna_input).exists():
+        mirna_df = parse_mirna_table(Path(mirna_input))
+        logger.info("Parsed miRNA prediction from %s", mirna_input)
     else:
-        mirna_df = pd.DataFrame({"transcript_id": df["transcript_id"].astype(str).unique()})
-        mirna_df["miRNA_site_count"] = np.nan
-        mirna_df["unique_miRNA_count"] = np.nan
-        mirna_df["conserved_site_count"] = np.nan
-        mirna_df["strongest_binding_energy"] = np.nan
-        logger.info("No miRNA table provided. Filled NA.")
+        mirna_df = pd.DataFrame({
+            "transcript_id_base": table["transcript_id_base"],
+            "miRNA_site_count": np.nan,
+            "unique_miRNA_count": np.nan,
+            "conserved_site_count": np.nan,
+            "strongest_binding_energy": np.nan,
+        })
+        logger.info("No miRNA prediction file supplied, fill NA")
 
-    merged = df.merge(motif_df, on="transcript_id", how="left")
-    merged = merged.merge(mirna_df, on="transcript_id", how="left")
-    merged.to_csv(os.path.join(cfg["output"]["tables_dir"], "transcript_features_step2.tsv"), sep="\t", index=False)
+    out = table.merge(motif_df, on="transcript_id_base", how="left").merge(mirna_df, on="transcript_id_base", how="left")
+    out_path = Path(cfg["outputs"]["tables_dir"]) / "transcript_features_motifs.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
+    logger.info("Motif feature table written: %s", out_path)
 
 
 if __name__ == "__main__":

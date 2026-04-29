@@ -2,180 +2,82 @@
 from __future__ import annotations
 
 import argparse
-import os
-import re
-import subprocess
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from utils import load_config, setup_logger, which
+from utils import add_common_cli_args, read_config, run_rnafold, setup_logger, which
 
 
-def run_rnafold_cached(seq: str, rnafold_bin: str, cache: dict[str, float]) -> float:
-    if not seq:
-        return np.nan
-    seq = seq.replace("T", "U").upper()
-    if seq in cache:
-        return cache[seq]
-
-    p = subprocess.run([rnafold_bin, "--noPS"], input=seq + "\n", capture_output=True, text=True)
-    if p.returncode != 0:
-        cache[seq] = np.nan
-        return np.nan
-    lines = [x.strip() for x in p.stdout.strip().splitlines() if x.strip()]
-    if len(lines) < 2:
-        cache[seq] = np.nan
-        return np.nan
-    m = re.search(r"\(([-0-9\.]+)\)", lines[-1])
-    if not m:
-        cache[seq] = np.nan
-        return np.nan
-    cache[seq] = float(m.group(1))
-    return cache[seq]
-
-
-def maybe_truncate(seq: str, max_len: int) -> str:
-    seq = seq or ""
-    if len(seq) <= max_len:
-        return seq
-    half = max_len // 2
-    return seq[:half] + seq[-half:]
-
-
-def sanitize_threshold_for_filename(threshold: float) -> str:
-    txt = f"{threshold:g}"
-    return txt.replace("-", "neg").replace(".", "p")
-
-
-def resolve_ddif_threshold(args_threshold: float | None, cfg: dict) -> float:
-    if args_threshold is not None:
-        return float(args_threshold)
-    return float(cfg.get("params", {}).get("ddif_threshold", 0.0))
-
-
-def compute_candidate_transcripts(df: pd.DataFrame, ddif_threshold: float, logger) -> tuple[pd.DataFrame, set[str]]:
-    needed_cols = {"gene_name", "transcript_id", "reference_transcript", "Delta_IF"}
-    if not needed_cols.issubset(set(df.columns)):
-        missing = sorted(needed_cols - set(df.columns))
-        logger.warning("Missing columns for candidate selection: %s. Fallback to all transcripts.", ",".join(missing))
-        return pd.DataFrame(), set(df["transcript_id"].astype(str).tolist())
-
-    tmp = df[["gene_name", "transcript_id", "reference_transcript", "Delta_IF"]].copy()
-    tmp["transcript_id"] = tmp["transcript_id"].astype(str)
-    tmp["reference_transcript"] = tmp["reference_transcript"].astype(str)
-    tmp["Delta_IF"] = pd.to_numeric(tmp["Delta_IF"], errors="coerce")
-
-    ref_df = tmp[["gene_name", "transcript_id", "Delta_IF"]].rename(
-        columns={"transcript_id": "ref_transcript", "Delta_IF": "ref_Delta_IF"}
-    )
-    merged = tmp.merge(ref_df, left_on=["gene_name", "reference_transcript"], right_on=["gene_name", "ref_transcript"], how="left")
-    merged["delta_Delta_IF"] = merged["Delta_IF"] - merged["ref_Delta_IF"]
-    merged["abs_delta_Delta_IF"] = merged["delta_Delta_IF"].abs()
-
-    candidate_pairs = merged[
-        (merged["transcript_id"] != merged["reference_transcript"])
-        & merged["delta_Delta_IF"].notna()
-        & (merged["abs_delta_Delta_IF"] >= float(ddif_threshold))
-    ].copy()
-
-    selected = set(candidate_pairs["transcript_id"].astype(str).tolist())
-    selected.update(candidate_pairs["reference_transcript"].astype(str).tolist())
-
-    return candidate_pairs, selected
+def read_fasta_dict(fp: Path):
+    d, cur = {}, None
+    with open(fp, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                cur = line[1:].split()[0]
+                d[cur] = ""
+            else:
+                d[cur] += line
+    return d
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Run RNAfold (optional) on UTR/CDS window")
-    ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--ddif-threshold", type=float, default=None)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Run RNAfold (optional) for UTR and CDS-start windows")
+    add_common_cli_args(parser)
+    args = parser.parse_args()
 
-    cfg = load_config(args.config)
-    ddif_threshold = resolve_ddif_threshold(args.ddif_threshold, cfg)
-    tables_dir = Path(cfg["output"]["tables_dir"])
-    logger = setup_logger("04_rnafold", str(tables_dir / "04_run_rnafold.log"))
+    cfg = read_config(args.config)
+    logger = setup_logger("04_run_rnafold", Path(args.log) if args.log else None)
 
-    step3_orf_nmd = tables_dir / "transcript_features_orf_nmd.tsv"
-    step3_default = tables_dir / "transcript_features_step3.tsv"
-    if step3_orf_nmd.exists():
-        input_path = step3_orf_nmd
-    else:
-        input_path = step3_default
-        logger.warning("Expected %s not found, fallback to %s", step3_orf_nmd, step3_default)
+    df = pd.read_csv(Path(cfg["outputs"]["tables_dir"]) / "transcript_features_orf_nmd.tsv", sep="\t")
+    seq_dir = Path(cfg["outputs"]["sequences_dir"])
+    tx = read_fasta_dict(seq_dir / "transcript.fa")
+    five = read_fasta_dict(seq_dir / "five_utr.fa")
+    three = read_fasta_dict(seq_dir / "three_utr.fa")
 
-    df = pd.read_csv(input_path, sep="\t")
-
-    df["five_utr_mfe"] = np.nan
-    df["cds_start_window_mfe"] = np.nan
-    df["three_utr_mfe"] = np.nan
-
-    total_transcripts = len(df)
-
-    if ddif_threshold <= 0:
-        selected_transcripts = set(df["transcript_id"].astype(str).tolist())
-        candidate_pairs = pd.DataFrame()
-    else:
-        candidate_pairs, selected_transcripts = compute_candidate_transcripts(df, ddif_threshold, logger)
-        threshold_tag = sanitize_threshold_for_filename(ddif_threshold)
-        candidate_tx_out = tables_dir / f"rnafold_candidate_transcripts.ddif_ge_{threshold_tag}.tsv"
-        pd.DataFrame({"transcript_id": sorted(selected_transcripts)}).to_csv(candidate_tx_out, sep="\t", index=False)
-
-        if len(candidate_pairs) == 0:
-            logger.warning("No candidate pair retained at |ΔΔIF| >= %s. All MFE columns remain NA.", ddif_threshold)
-            df.to_csv(tables_dir / "transcript_features_step4.tsv", sep="\t", index=False)
-            logger.info("ddif_threshold: %s", ddif_threshold)
-            logger.info("total transcripts: %d", total_transcripts)
-            logger.info("candidate pairs: 0")
-            logger.info("candidate genes: 0")
-            logger.info("transcripts selected for RNAfold: 0")
-            logger.info("unique sequences folded: 0")
-            return
-
-    rnafold_bin = cfg["params"].get("rnafold_binary", "RNAfold")
+    rnafold_bin = cfg["params"].get("rnafold_bin", "RNAfold")
     installed = which(rnafold_bin) is not None
-    if not installed:
-        logger.warning("RNAfold not found. Fill NA for mfe columns.")
-        df.to_csv(tables_dir / "transcript_features_step4.tsv", sep="\t", index=False)
-        return
+    max_len = int(cfg["params"].get("rnafold_max_len", 1500))
+    flank = int(cfg["params"].get("cds_start_flank", 70))
 
-    up = int(cfg["params"].get("cds_start_window_upstream", 70))
-    down = int(cfg["params"].get("cds_start_window_downstream", 70))
-    max_len = int(cfg["params"].get("rnafold_max_len", 2000))
+    rows = []
+    for _, r in df.iterrows():
+        tid = r["transcript_id_base"]
+        five_seq = five.get(tid, "")
+        tx_seq = tx.get(tid, "")
+        three_seq = three.get(tid, "")
 
-    fold_cache: dict[str, float] = {}
+        cds_start = len(five_seq)
+        start_window = tx_seq[max(0, cds_start - flank): min(len(tx_seq), cds_start + flank)] if tx_seq else ""
 
-    for idx, r in df.iterrows():
-        tx_id = str(r.get("transcript_id", ""))
-        if tx_id not in selected_transcripts:
-            continue
+        def clip(s: str):
+            if len(s) <= max_len:
+                return s
+            center = len(s) // 2
+            half = max_len // 2
+            return s[max(0, center - half): center + half]
 
-        tx = str(r.get("transcript_sequence", "") or "")
-        utr5 = maybe_truncate(str(r.get("five_utr_sequence", "") or ""), max_len)
-        utr3 = maybe_truncate(str(r.get("three_utr_sequence", "") or ""), max_len)
-
-        sp = r.get("start_codon_pos_in_transcript", np.nan)
-        if pd.notna(sp):
-            sp = int(sp)
-            l = max(0, sp - up)
-            rr = min(len(tx), sp + 3 + down)
-            win = tx[l:rr]
+        if installed:
+            five_mfe = run_rnafold(clip(five_seq), rnafold_bin)
+            start_mfe = run_rnafold(clip(start_window), rnafold_bin)
+            three_mfe = run_rnafold(clip(three_seq), rnafold_bin)
         else:
-            win = ""
+            five_mfe = start_mfe = three_mfe = np.nan
 
-        df.at[idx, "five_utr_mfe"] = run_rnafold_cached(utr5, rnafold_bin, fold_cache)
-        df.at[idx, "cds_start_window_mfe"] = run_rnafold_cached(win, rnafold_bin, fold_cache)
-        df.at[idx, "three_utr_mfe"] = run_rnafold_cached(utr3, rnafold_bin, fold_cache)
+        rows.append({"transcript_id_base": tid, "five_utr_mfe": five_mfe, "cds_start_window_mfe": start_mfe, "three_utr_mfe": three_mfe})
 
-    df.to_csv(tables_dir / "transcript_features_step4.tsv", sep="\t", index=False)
+    mfe_df = pd.DataFrame(rows)
+    out = df.merge(mfe_df, on="transcript_id_base", how="left")
+    out_path = Path(cfg["outputs"]["tables_dir"]) / "transcript_features.tsv"
+    out.to_csv(out_path, sep="\t", index=False)
 
-    logger.info("ddif_threshold: %s", ddif_threshold)
-    logger.info("total transcripts: %d", total_transcripts)
-    logger.info("candidate pairs: %d", len(candidate_pairs) if ddif_threshold > 0 else "NA (threshold<=0)")
-    logger.info("candidate genes: %d", candidate_pairs["gene_name"].nunique() if ddif_threshold > 0 else "NA (threshold<=0)")
-    logger.info("transcripts selected for RNAfold: %d", len(selected_transcripts))
-    logger.info("unique sequences folded: %d", len(fold_cache))
+    if not installed:
+        logger.warning("RNAfold not found. MFE columns filled with NA. Install ViennaRNA and set params.rnafold_bin.")
+    logger.info("Final transcript feature table written: %s", out_path)
 
 
 if __name__ == "__main__":
