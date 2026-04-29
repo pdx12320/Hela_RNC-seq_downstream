@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import kruskal, mannwhitneyu, spearmanr
+from scipy.stats import kruskal, mannwhitneyu, spearmanr, wilcoxon, binomtest
 
 from utils import add_common_cli_args, read_config, setup_logger
 
@@ -338,6 +338,106 @@ def add_high_low_statistics(comp: pd.DataFrame, threshold: float) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+def add_direction_summary(comp: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    rows = []
+
+    features = [
+        "delta_5utr_length",
+        "delta_cds_length",
+        "delta_3utr_length",
+        "delta_transcript_length",
+        "delta_protein_length",
+        "delta_uORF_count",
+        "delta_polyA_signal_count",
+        "delta_5utr_mfe",
+    ]
+
+    for feat in features:
+        if feat not in comp.columns:
+            continue
+
+        x = pd.to_numeric(comp[feat], errors="coerce").dropna()
+        x_nonzero = x[x != 0]
+
+        if len(x) == 0:
+            rows.append(
+                {
+                    "feature": feat,
+                    "ddif_threshold": threshold,
+                    "n": 0,
+                    "median_delta": np.nan,
+                    "mean_delta": np.nan,
+                    "n_positive": 0,
+                    "n_negative": 0,
+                    "n_zero": 0,
+                    "percent_positive": np.nan,
+                    "percent_negative": np.nan,
+                    "wilcoxon_p_two_sided": np.nan,
+                    "wilcoxon_p_less": np.nan,
+                    "wilcoxon_p_greater": np.nan,
+                    "binomial_p_direction": np.nan,
+                    "interpretation": "no valid data",
+                }
+            )
+            continue
+
+        n_pos = int((x > 0).sum())
+        n_neg = int((x < 0).sum())
+        n_zero = int((x == 0).sum())
+
+        p_two = p_less = p_greater = np.nan
+
+        if len(x_nonzero) >= 5:
+            try:
+                p_two = wilcoxon(x_nonzero, alternative="two-sided").pvalue
+                p_less = wilcoxon(x_nonzero, alternative="less").pvalue
+                p_greater = wilcoxon(x_nonzero, alternative="greater").pvalue
+            except Exception:
+                pass
+
+        # sign test: among non-zero deltas, are positives/negatives imbalanced?
+        p_binom = np.nan
+        if (n_pos + n_neg) >= 5:
+            p_binom = binomtest(
+                k=min(n_pos, n_neg),
+                n=n_pos + n_neg,
+                p=0.5,
+                alternative="two-sided",
+            ).pvalue
+
+        median_delta = float(x.median())
+        mean_delta = float(x.mean())
+
+        if median_delta < 0:
+            interp = "high isoforms tend to have smaller values"
+        elif median_delta > 0:
+            interp = "high isoforms tend to have larger values"
+        else:
+            interp = "no median directional shift"
+
+        rows.append(
+            {
+                "feature": feat,
+                "ddif_threshold": threshold,
+                "n": len(x),
+                "median_delta": median_delta,
+                "mean_delta": mean_delta,
+                "n_positive": n_pos,
+                "n_negative": n_neg,
+                "n_zero": n_zero,
+                "percent_positive": n_pos / len(x) * 100,
+                "percent_negative": n_neg / len(x) * 100,
+                "wilcoxon_p_two_sided": p_two,
+                "wilcoxon_p_less": p_less,
+                "wilcoxon_p_greater": p_greater,
+                "binomial_p_direction": p_binom,
+                "interpretation": interp,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compare high-efficiency vs low-efficiency isoforms within each gene"
@@ -392,23 +492,28 @@ def main():
     filtered_fp = tables_dir / f"high_vs_low_isoform_comparison.filtered.ddif_gt_{threshold_tag}.tsv"
     comp_filtered.to_csv(filtered_fp, sep="\t", index=False)
 
-    # 为了兼容原来的 06 脚本命名，也把 high-vs-low 的结果保存成默认 pairwise 文件
+   # 为了兼容原来的 06 脚本命名，也把 high-vs-low 的结果保存成默认 pairwise 文件
     pair_fp = tables_dir / "isoform_pairwise_comparison.tsv"
     comp_filtered.to_csv(pair_fp, sep="\t", index=False)
 
-    stats_df = add_high_low_statistics(comp_filtered, threshold)
-    stats_fp = tables_dir / "statistics_summary.tsv"
-    stats_df.to_csv(stats_fp, sep="\t", index=False)
+stats_df = add_high_low_statistics(comp_filtered, threshold)
+stats_fp = tables_dir / "statistics_summary.tsv"
+stats_df.to_csv(stats_fp, sep="\t", index=False)
 
-    logger.info("Input transcript feature table: %s", input_fp)
-    logger.info("All high-vs-low gene comparison written: %s", all_fp)
-    logger.info("Filtered high-vs-low comparison written: %s", filtered_fp)
-    logger.info("Default isoform_pairwise_comparison.tsv overwritten with high-vs-low results: %s", pair_fp)
-    logger.info("Statistics summary written: %s", stats_fp)
+direction_df = add_direction_summary(comp_filtered, threshold)
+direction_fp = tables_dir / "high_vs_low_feature_direction_summary.tsv"
+direction_df.to_csv(direction_fp, sep="\t", index=False)
+logger.info("High-vs-low feature direction summary written: %s", direction_fp)
 
-    logger.info("Threshold: high_Delta_IF - low_Delta_IF > %.4g", threshold)
-    logger.info("Genes with >=2 valid isoforms: %d", len(comp_all))
-    logger.info("Genes retained after threshold: %d", len(comp_filtered))
+logger.info("Input transcript feature table: %s", input_fp)
+logger.info("All high-vs-low gene comparison written: %s", all_fp)
+logger.info("Filtered high-vs-low comparison written: %s", filtered_fp)
+logger.info("Default isoform_pairwise_comparison.tsv overwritten with high-vs-low results: %s", pair_fp)
+logger.info("Statistics summary written: %s", stats_fp)
+
+logger.info("Threshold: high_Delta_IF - low_Delta_IF > %.4g", threshold)
+logger.info("Genes with >=2 valid isoforms: %d", len(comp_all))
+logger.info("Genes retained after threshold: %d", len(comp_filtered))
 
     if not comp_filtered.empty:
         logger.info(
