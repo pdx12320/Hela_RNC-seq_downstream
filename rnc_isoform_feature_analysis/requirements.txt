@@ -1,9 +1,9 @@
-pandas>=2.0
-numpy>=1.24
-biopython>=1.81
+pandas>=1.5
+numpy>=1.23
+biopython>=1.80
 pyfaidx>=0.7
 gffutils>=0.12
-scipy>=1.11
-matplotlib>=3.7
-seaborn>=0.13
-PyYAML>=6.0
+scipy>=1.10
+matplotlib>=3.6
+seaborn>=0.12
+pyyaml>=6.0
