@@ -1,0 +1,24 @@
+project_name: rnc_isoform_feature_analysis
+input:
+  results_csv: results.csv
+  annotation_gtf: annotation.gtf
+  genome_fasta: genome.fa
+  canonical_transcripts_tsv: null
+  domain_tsv: null
+  mirna_tsv: null
+output:
+  base_dir: output
+  sequences_dir: output/sequences
+  tables_dir: output/tables
+  figures_dir: output/figures
+params:
+  threads: 4
+  nmd_distance_threshold: 55
+  cds_start_window_upstream: 70
+  cds_start_window_downstream: 70
+  rnafold_max_len: 2000
+  rnafold_binary: RNAfold
+  id_match_use_base: true
+  gffutils_db: output/tables/annotation.db
+  # ddif_threshold controls candidate isoform pair filtering by abs(delta_Delta_IF)
+  ddif_threshold: 0.0
