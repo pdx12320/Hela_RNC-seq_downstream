@@ -15,3 +15,4 @@ params:
   rnafold_bin: "RNAfold"
   rnafold_max_len: 1500
   cds_start_flank: 70
+  ddif_threshold: 0.2
